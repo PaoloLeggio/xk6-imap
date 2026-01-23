@@ -1,4 +1,4 @@
-module github.com/eugercek/xk6-imap
+module github.com/PaoloLeggio/xk6-imap
 
 go 1.18
 

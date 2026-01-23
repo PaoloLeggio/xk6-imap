@@ -9,7 +9,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 
-	ec "github.com/eugercek/xk6-imap/client"
+	ec "github.com/PaoloLeggio/xk6-imap/client"
 	"go.k6.io/k6/js/modules"
 )
 
