@@ -6,18 +6,23 @@ import (
 	"mime/quotedprintable"
 	"net/textproto"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/grafana/sobek"
+	"go.k6.io/k6/js/modules"
+	"go.k6.io/k6/js/promises"
 )
 
 type EmailClient struct {
-	Email    string
-	Password string
-	Url      string
-	Port     int
-	client   *client.Client
+	Vu         modules.VU
+	Email      string
+	Password   string
+	Url        string
+	Port       int
+	client     *client.Client
 }
 
 // convertJSObjectToMIMEHeader converte un oggetto JavaScript in textproto.MIMEHeader
@@ -50,6 +55,171 @@ func convertJSObjectToMIMEHeader(obj map[string]interface{}) textproto.MIMEHeade
 	return header
 }
 
+// messageToMap converte un *imap.Message in un map[string]interface{} compatibile con k6/JavaScript
+func messageToMap(msg *imap.Message) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	
+	// Subject
+	if msg.Envelope != nil {
+		result["subject"] = msg.Envelope.Subject
+		
+		// From
+		if len(msg.Envelope.From) > 0 {
+			fromAddrs := make([]string, 0, len(msg.Envelope.From))
+			for _, addr := range msg.Envelope.From {
+				if addr.MailboxName != "" && addr.HostName != "" {
+					fromAddrs = append(fromAddrs, fmt.Sprintf("%s@%s", addr.MailboxName, addr.HostName))
+				} else if addr.MailboxName != "" {
+					fromAddrs = append(fromAddrs, addr.MailboxName)
+				}
+			}
+			if len(fromAddrs) == 1 {
+				result["from"] = fromAddrs[0]
+			} else {
+				result["from"] = fromAddrs
+			}
+		}
+		
+		// To
+		if len(msg.Envelope.To) > 0 {
+			toAddrs := make([]string, 0, len(msg.Envelope.To))
+			for _, addr := range msg.Envelope.To {
+				if addr.MailboxName != "" && addr.HostName != "" {
+					toAddrs = append(toAddrs, fmt.Sprintf("%s@%s", addr.MailboxName, addr.HostName))
+				} else if addr.MailboxName != "" {
+					toAddrs = append(toAddrs, addr.MailboxName)
+				}
+			}
+			result["to"] = toAddrs
+		}
+		
+		// Cc
+		if len(msg.Envelope.Cc) > 0 {
+			ccAddrs := make([]string, 0, len(msg.Envelope.Cc))
+			for _, addr := range msg.Envelope.Cc {
+				if addr.MailboxName != "" && addr.HostName != "" {
+					ccAddrs = append(ccAddrs, fmt.Sprintf("%s@%s", addr.MailboxName, addr.HostName))
+				} else if addr.MailboxName != "" {
+					ccAddrs = append(ccAddrs, addr.MailboxName)
+				}
+			}
+			result["cc"] = ccAddrs
+		}
+		
+		// Bcc
+		if len(msg.Envelope.Bcc) > 0 {
+			bccAddrs := make([]string, 0, len(msg.Envelope.Bcc))
+			for _, addr := range msg.Envelope.Bcc {
+				if addr.MailboxName != "" && addr.HostName != "" {
+					bccAddrs = append(bccAddrs, fmt.Sprintf("%s@%s", addr.MailboxName, addr.HostName))
+				} else if addr.MailboxName != "" {
+					bccAddrs = append(bccAddrs, addr.MailboxName)
+				}
+			}
+			result["bcc"] = bccAddrs
+		}
+		
+		// Date (data di invio dal mittente)
+		if !msg.Envelope.Date.IsZero() {
+			result["date"] = msg.Envelope.Date.Format(time.RFC3339)
+			result["dateTimestamp"] = msg.Envelope.Date.Unix()
+		}
+	}
+	
+	// InternalDate (data di arrivo sul server)
+	if !msg.InternalDate.IsZero() {
+		result["internalDate"] = msg.InternalDate.Format(time.RFC3339)
+		result["internalDateTimestamp"] = msg.InternalDate.Unix()
+	}
+	
+	// Body
+	section, _ := imap.ParseBodySectionName("BODY[TEXT]")
+	r := msg.GetBody(section)
+	if r != nil {
+		qr := quotedprintable.NewReader(r)
+		bs, err := ioutil.ReadAll(qr)
+		if err == nil {
+			result["body"] = string(bs)
+		}
+	}
+	
+	// Headers (se disponibili)
+	if len(msg.Body) > 0 {
+		// Prova a recuperare gli headers dal body
+		headerSection, _ := imap.ParseBodySectionName("BODY[HEADER]")
+		headerReader := msg.GetBody(headerSection)
+		if headerReader != nil {
+			headerBytes, err := ioutil.ReadAll(headerReader)
+			if err == nil {
+				headers := make(map[string]interface{})
+				headerText := string(headerBytes)
+				lines := strings.Split(headerText, "\r\n")
+				var currentKey string
+				var currentValues []string
+				
+				for _, line := range lines {
+					line = strings.TrimRight(line, "\r\n")
+					if line == "" {
+						// Fine degli headers
+						break
+					}
+					if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+						// Continuazione della riga precedente
+						if currentKey != "" && len(currentValues) > 0 {
+							currentValues[len(currentValues)-1] += " " + strings.TrimSpace(line)
+						}
+					} else if strings.Contains(line, ":") {
+						// Salva l'header precedente
+						if currentKey != "" {
+							existingValue, exists := headers[currentKey]
+							if exists {
+								// Header già presente, aggiungi ai valori esistenti
+								if existingArray, ok := existingValue.([]string); ok {
+									headers[currentKey] = append(existingArray, currentValues...)
+								} else if existingStr, ok := existingValue.(string); ok {
+									headers[currentKey] = []string{existingStr, currentValues[0]}
+								}
+							} else {
+								// Nuovo header
+								if len(currentValues) == 1 {
+									headers[currentKey] = currentValues[0]
+								} else {
+									headers[currentKey] = currentValues
+								}
+							}
+						}
+						// Nuovo header
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) == 2 {
+							currentKey = strings.TrimSpace(strings.ToLower(parts[0]))
+							currentValues = []string{strings.TrimSpace(parts[1])}
+						} else {
+							currentKey = ""
+							currentValues = nil
+						}
+					}
+				}
+				// Aggiungi l'ultimo header
+				if currentKey != "" {
+					if len(currentValues) == 1 {
+						headers[currentKey] = currentValues[0]
+					} else {
+						headers[currentKey] = currentValues
+					}
+				}
+				if len(headers) > 0 {
+					result["headers"] = headers
+				}
+			}
+		}
+	}
+	
+	// Message ID (UID)
+	result["uid"] = msg.SeqNum
+	
+	return result, nil
+}
+
 func (e *EmailClient) Login() string {
 	c, err := client.DialTLS(e.Url+":"+strconv.Itoa(e.Port), nil)
 
@@ -69,18 +239,18 @@ func (e *EmailClient) Login() string {
 
 }
 
-func (e *EmailClient) Read(headerObj map[string]interface{}) (string, string) {
+func (e *EmailClient) Read(headerObj map[string]interface{}) (map[string]interface{}, string) {
 	fmt.Println("Read called with headerObj:", headerObj)
 	
 	// Verifica che il client sia connesso
 	if e.client == nil {
-		return "", "Client not connected. Call login() first."
+		return nil, "Client not connected. Call login() first."
 	}
 	
 	_, err := e.client.Select("INBOX", true)
 	if err != nil {
 		fmt.Printf("Error selecting INBOX: %v\n", err)
-		return "", err.Error()
+		return nil, err.Error()
 	}
 
 	// Converti l'oggetto JavaScript in textproto.MIMEHeader
@@ -94,13 +264,13 @@ func (e *EmailClient) Read(headerObj map[string]interface{}) (string, string) {
 	ids, err := e.client.Search(criteria)
 	if err != nil {
 		fmt.Printf("Error searching: %v\n", err)
-		return "", err.Error()
+		return nil, err.Error()
 	}
 
 	fmt.Printf("Found %d message IDs\n", len(ids))
 
 	if len(ids) == 0 {
-		return "", "No messages found"
+		return nil, "No messages found"
 	}
 
 	// Prendi solo il primo messaggio (il più recente, ultimo ID)
@@ -108,14 +278,19 @@ func (e *EmailClient) Read(headerObj map[string]interface{}) (string, string) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(latestID)
 
-	items := []imap.FetchItem{imap.FetchItem("BODY[TEXT]")}
+	// Recupera ENVELOPE (subject, from, to, date) e BODY[TEXT] (body)
+	items := []imap.FetchItem{
+		imap.FetchItem("ENVELOPE"),
+		imap.FetchItem("BODY[TEXT]"),
+		imap.FetchItem("BODY[HEADER]"),
+	}
 	messages := make(chan *imap.Message, 1)
 
 	fmt.Printf("Fetching message ID %d...\n", latestID)
 	err = e.client.Fetch(seqSet, items, messages)
 	if err != nil {
 		fmt.Printf("Error fetching: %v\n", err)
-		return "", err.Error()
+		return nil, err.Error()
 	}
 
 	fmt.Println("Fetch completed, reading from channel...")
@@ -123,113 +298,151 @@ func (e *EmailClient) Read(headerObj map[string]interface{}) (string, string) {
 	fmt.Println("Message received from channel")
 	
 	if msg == nil {
-		return "", "No message"
+		return nil, "No message"
 	}
 
-	section, _ := imap.ParseBodySectionName("BODY[TEXT]")
-	r := msg.GetBody(section)
-
-	if r == nil {
-		return "", "Could not get message body"
-	}
-
-	qr := quotedprintable.NewReader(r)
-	bs, err := ioutil.ReadAll(qr)
-
+	emailMap, err := messageToMap(msg)
 	if err != nil {
-		return "", err.Error()
+		fmt.Printf("Error converting message to map: %v\n", err)
+		return nil, err.Error()
 	}
 
-	fmt.Println("Read successful, message length:", len(bs))
-	return string(bs), ""
-
+	fmt.Println("Read successful")
+	return emailMap, ""
 }
 
-func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs int64) (string, string) {
-	fmt.Println("WaitNewEmail started")
-	startTime := time.Now()
-	timeoutDuration := time.Duration(timeoutMs) * time.Millisecond
+func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs int64) *sobek.Promise {
+	// Verifica che il VU sia disponibile
+	if e.Vu == nil {
+		panic("VU context not available. EmailClient must be created inside the default function, not in init context.")
+	}
 	
-	// Converti l'oggetto JavaScript in textproto.MIMEHeader
-	header := convertJSObjectToMIMEHeader(headerObj)
+	promise, resolve, reject := promises.New(e.Vu)
 	
-	// Polling ogni 2 secondi
-	pollInterval := 2 * time.Second
+	// Verifica che il client sia connesso
+	if e.client == nil {
+		reject(fmt.Errorf("Client not connected. Call login() first."))
+		return promise
+	}
 	
-	for {
-		// Controlla se il timeout è scaduto
-		if time.Since(startTime) >= timeoutDuration {
-			return "", fmt.Sprintf("Timeout: no new email found within %d ms", timeoutMs)
-		}
+	go func() {
+		fmt.Println("WaitNewEmail started, timeout:", timeoutMs, "ms")
+		startTime := time.Now()
+		// Sottrai 1 secondo per evitare problemi di precisione con il server IMAP
+		searchSince := startTime.Add(-1 * time.Second)
+		timeoutDuration := time.Duration(timeoutMs) * time.Millisecond
 		
-		// Seleziona la mailbox
-		_, err := e.client.Select("INBOX", true)
-		if err != nil {
-			fmt.Println(err)
-			return "", err.Error()
-		}
+		// Converti l'oggetto JavaScript in textproto.MIMEHeader
+		header := convertJSObjectToMIMEHeader(headerObj)
 		
-		// Crea i criteri di ricerca solo con i filtri Header (senza Since)
-		criteria := &imap.SearchCriteria{
-			Header: header,
-		}
+		// Polling ogni 2 secondi
+		pollInterval := 2 * time.Second
+		iteration := 0
 		
-		ids, err := e.client.Search(criteria)
-		if err != nil {
-			fmt.Println(err)
-			return "", err.Error()
-		}
-		
-		// Se troviamo email, verifica manualmente la data
-		if len(ids) > 0 {
-			// Ordina gli ID in ordine decrescente per controllare le più recenti prima
-			// Gli ID sono già ordinati crescente, quindi prendiamo dall'ultimo
-			for i := len(ids) - 1; i >= 0; i-- {
-				msgID := ids[i]
+		for {
+			iteration++
+			elapsed := time.Since(startTime)
+			
+			// Controlla se il timeout è scaduto
+			if elapsed >= timeoutDuration {
+				fmt.Printf("WaitNewEmail timeout after %d iterations, elapsed: %v\n", iteration, elapsed)
+				reject(fmt.Errorf("Timeout: no new email found within %d ms", timeoutMs))
+				return
+			}
+			
+			fmt.Printf("WaitNewEmail iteration %d, elapsed: %v\n", iteration, elapsed)
+			
+			// Seleziona la mailbox
+			_, err := e.client.Select("INBOX", true)
+			if err != nil {
+				fmt.Printf("Error selecting INBOX: %v\n", err)
+				reject(err)
+				return
+			}
+			
+			// Crea i criteri di ricerca con Since per filtrare solo email nuove
+			// Since usa la "Internal date" (data di arrivo sul server)
+			criteria := &imap.SearchCriteria{
+				Header: header,
+				Since:  searchSince,
+			}
+			
+			ids, err := e.client.Search(criteria)
+			if err != nil {
+				fmt.Printf("Error searching: %v\n", err)
+				reject(err)
+				return
+			}
+			
+			fmt.Printf("Found %d emails matching criteria (with Since filter)\n", len(ids))
+			
+			// Se troviamo email, controlla solo l'ultima (più recente)
+			// perché quelle precedenti non ci servono
+			if len(ids) > 0 {
+				// Prendi solo l'ultimo ID (il più recente, dato che sono ordinati crescente)
+				latestID := ids[len(ids)-1]
 				
 				seqSet := new(imap.SeqSet)
-				seqSet.AddNum(msgID)
+				seqSet.AddNum(latestID)
 				
-				// Recupera ENVELOPE per ottenere la data del messaggio
-				items := []imap.FetchItem{imap.FetchItem("ENVELOPE"), imap.FetchItem("BODY[TEXT]")}
+				// Recupera ENVELOPE, INTERNALDATE, BODY[TEXT] e BODY[HEADER]
+				items := []imap.FetchItem{
+					imap.FetchItem("ENVELOPE"),
+					imap.FetchItem("INTERNALDATE"),
+					imap.FetchItem("BODY[TEXT]"),
+					imap.FetchItem("BODY[HEADER]"),
+				}
 				messages := make(chan *imap.Message, 1)
 				
+				fmt.Printf("Fetching latest message ID %d to check date...\n", latestID)
 				err = e.client.Fetch(seqSet, items, messages)
 				if err != nil {
-					fmt.Println(err)
+					fmt.Printf("Error fetching message ID %d: %v\n", latestID, err)
+					// Continua il polling se c'è un errore nel fetch
+					time.Sleep(pollInterval)
 					continue
 				}
 				
 				msg := <-messages
 				if msg == nil {
+					fmt.Printf("Message ID %d is nil\n", latestID)
+					// Continua il polling se il messaggio è nil
+					time.Sleep(pollInterval)
 					continue
 				}
 				
-				// Verifica che la data del messaggio sia successiva a startTime
-				if msg.Envelope != nil && msg.Envelope.Date.After(startTime) {
-					// Questa è una nuova email, recupera il body
-					section, _ := imap.ParseBodySectionName("BODY[TEXT]")
-					r := msg.GetBody(section)
+				// Verifica che la data interna (data di arrivo sul server) sia successiva a startTime
+				if !msg.InternalDate.IsZero() {
+					fmt.Printf("Message ID %d InternalDate: %v, startTime: %v, after: %v\n", 
+						latestID, msg.InternalDate, startTime, msg.InternalDate.After(startTime))
 					
-					if r == nil {
-						return "", "Could not get message body"
+					if msg.InternalDate.After(startTime) {
+						// Questa è una nuova email, convertila in oggetto strutturato
+						fmt.Printf("Found new email with ID %d\n", latestID)
+						
+						emailMap, err := messageToMap(msg)
+						if err != nil {
+							fmt.Printf("Error converting message to map: %v\n", err)
+							reject(err)
+							return
+						}
+						
+						fmt.Printf("WaitNewEmail success after %d iterations\n", iteration)
+						resolve(emailMap)
+						return
 					}
-					
-					qr := quotedprintable.NewReader(r)
-					bs, err := ioutil.ReadAll(qr)
-					
-					if err != nil {
-						return "", err.Error()
-					}
-					
-					return string(bs), ""
+				} else {
+					fmt.Printf("Message ID %d has no InternalDate\n", latestID)
 				}
 			}
+			
+			// Aspetta prima del prossimo polling
+			fmt.Printf("No new emails found, waiting %v before next check\n", pollInterval)
+			time.Sleep(pollInterval)
 		}
-		
-		// Aspetta prima del prossimo polling
-		time.Sleep(pollInterval)
-	}
+	}()
+	
+	return promise
 }
 
 func (e *EmailClient) Logout() {
