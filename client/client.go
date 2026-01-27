@@ -339,6 +339,9 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 		pollInterval := 2 * time.Second
 		iteration := 0
 		
+		// Set di message ID già controllati e non validi (da skippare)
+		skippedIDs := make(map[uint32]bool)
+		
 		for {
 			iteration++
 			elapsed := time.Since(startTime)
@@ -382,6 +385,13 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 				// Prendi solo l'ultimo ID (il più recente, dato che sono ordinati crescente)
 				latestID := ids[len(ids)-1]
 				
+				// Se questo ID è già stato controllato e non era valido, skippalo
+				if skippedIDs[latestID] {
+					fmt.Printf("Skipping message ID %d (already checked and not valid)\n", latestID)
+					time.Sleep(pollInterval)
+					continue
+				}
+				
 				seqSet := new(imap.SeqSet)
 				seqSet.AddNum(latestID)
 				
@@ -406,6 +416,8 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 				msg := <-messages
 				if msg == nil {
 					fmt.Printf("Message ID %d is nil\n", latestID)
+					// Aggiungi l'ID al set di skipped perché non è valido
+					skippedIDs[latestID] = true
 					// Continua il polling se il messaggio è nil
 					time.Sleep(pollInterval)
 					continue
@@ -430,14 +442,20 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 						fmt.Printf("WaitNewEmail success after %d iterations\n", iteration)
 						resolve(emailMap)
 						return
+					} else {
+						// La data non è valida, aggiungi l'ID al set di skipped
+						fmt.Printf("Message ID %d is not new (InternalDate not after startTime), adding to skipped list\n", latestID)
+						skippedIDs[latestID] = true
 					}
 				} else {
 					fmt.Printf("Message ID %d has no InternalDate\n", latestID)
+					// Aggiungi l'ID al set di skipped perché non ha InternalDate
+					skippedIDs[latestID] = true
 				}
 			}
 			
 			// Aspetta prima del prossimo polling
-			fmt.Printf("No new emails found, waiting %v before next check\n", pollInterval)
+			// fmt.Printf("No new emails found, waiting %v before next check\n", pollInterval)
 			time.Sleep(pollInterval)
 		}
 	}()
