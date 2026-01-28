@@ -463,6 +463,62 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 	return promise
 }
 
+// DeleteEmailsOlderThan elimina tutte le email più vecchie della data specificata
+// La data viene confrontata con InternalDate (data di arrivo sul server)
+// Restituisce il numero di email eliminate e un eventuale errore come stringa
+// beforeTimestampUnix è un timestamp Unix in secondi (int64)
+// Usage da JavaScript: client.DeleteEmailsOlderThan(Math.floor(Date.now() / 1000) - 86400) // 24 ore fa
+func (e *EmailClient) DeleteEmailsOlderThan(beforeTimestampUnix int64) (int, string) {
+	// Verifica che il client sia connesso
+	if e.client == nil {
+		return 0, "client not connected. Call login() first"
+	}
+
+	// Seleziona la mailbox INBOX
+	_, err := e.client.Select("INBOX", true)
+	if err != nil {
+		return 0, fmt.Sprintf("error selecting INBOX: %v", err)
+	}
+
+	// Converti il timestamp Unix in time.Time
+	beforeDate := time.Unix(beforeTimestampUnix, 0)
+
+	// Cerca tutte le email più vecchie della data specificata
+	// Before usa la "Internal date" (data di arrivo sul server)
+	criteria := &imap.SearchCriteria{
+		Before: beforeDate,
+	}
+
+	ids, err := e.client.Search(criteria)
+	if err != nil {
+		return 0, fmt.Sprintf("error searching emails: %v", err)
+	}
+
+	if len(ids) == 0 {
+		return 0, "" // Nessuna email da eliminare
+	}
+
+	// Crea un SeqSet con tutti gli ID trovati
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(ids...)
+
+	// Marca le email come cancellate usando il flag \Deleted
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+	err = e.client.Store(seqSet, item, flags, nil)
+	if err != nil {
+		return 0, fmt.Sprintf("error marking emails as deleted: %v", err)
+	}
+
+	// Rimuovi definitivamente le email marcate come cancellate
+	err = e.client.Expunge(nil)
+	if err != nil {
+		return 0, fmt.Sprintf("error expunging emails: %v", err)
+	}
+
+	return len(ids), ""
+}
+
 func (e *EmailClient) Logout() {
 	if e.client != nil {
 		e.client.Logout()
