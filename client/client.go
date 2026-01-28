@@ -474,8 +474,8 @@ func (e *EmailClient) DeleteEmailsOlderThan(beforeTimestampUnix int64) (int, str
 		return 0, "client not connected. Call login() first"
 	}
 
-	// Seleziona la mailbox INBOX
-	_, err := e.client.Select("INBOX", true)
+	// Seleziona la mailbox INBOX in modalità read-write (false) per permettere l'eliminazione
+	_, err := e.client.Select("INBOX", false)
 	if err != nil {
 		return 0, fmt.Sprintf("error selecting INBOX: %v", err)
 	}
