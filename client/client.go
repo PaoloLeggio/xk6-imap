@@ -23,6 +23,7 @@ type EmailClient struct {
 	Url        string
 	Port       int
 	client     *client.Client
+	cancelChan chan struct{} // Canale per interrompere WaitNewEmail
 }
 
 // convertJSObjectToMIMEHeader converte un oggetto JavaScript in textproto.MIMEHeader
@@ -325,6 +326,10 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 		return promise
 	}
 	
+	// Crea un nuovo canale di cancellazione per questa promise
+	e.cancelChan = make(chan struct{})
+	cancelChan := e.cancelChan
+	
 	go func() {
 		fmt.Println("WaitNewEmail started, timeout:", timeoutMs, "ms")
 		startTime := time.Now()
@@ -343,6 +348,15 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 		skippedIDs := make(map[uint32]bool)
 		
 		for {
+			// Controlla se la promise è stata interrotta
+			select {
+			case <-cancelChan:
+				fmt.Printf("WaitNewEmail cancelled after %d iterations\n", iteration)
+				reject(fmt.Errorf("WaitNewEmail was cancelled"))
+				return
+			default:
+			}
+			
 			iteration++
 			elapsed := time.Since(startTime)
 			
@@ -388,7 +402,14 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 				// Se questo ID è già stato controllato e non era valido, skippalo
 				if skippedIDs[latestID] {
 					fmt.Printf("Skipping message ID %d (already checked and not valid)\n", latestID)
-					time.Sleep(pollInterval)
+					select {
+					case <-cancelChan:
+						fmt.Printf("WaitNewEmail cancelled after %d iterations\n", iteration)
+						reject(fmt.Errorf("WaitNewEmail was cancelled"))
+						return
+					case <-time.After(pollInterval):
+						// Continua il loop
+					}
 					continue
 				}
 				
@@ -409,7 +430,14 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 				if err != nil {
 					fmt.Printf("Error fetching message ID %d: %v\n", latestID, err)
 					// Continua il polling se c'è un errore nel fetch
-					time.Sleep(pollInterval)
+					select {
+					case <-cancelChan:
+						fmt.Printf("WaitNewEmail cancelled after %d iterations\n", iteration)
+						reject(fmt.Errorf("WaitNewEmail was cancelled"))
+						return
+					case <-time.After(pollInterval):
+						// Continua il loop
+					}
 					continue
 				}
 				
@@ -419,7 +447,14 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 					// Aggiungi l'ID al set di skipped perché non è valido
 					skippedIDs[latestID] = true
 					// Continua il polling se il messaggio è nil
-					time.Sleep(pollInterval)
+					select {
+					case <-cancelChan:
+						fmt.Printf("WaitNewEmail cancelled after %d iterations\n", iteration)
+						reject(fmt.Errorf("WaitNewEmail was cancelled"))
+						return
+					case <-time.After(pollInterval):
+						// Continua il loop
+					}
 					continue
 				}
 				
@@ -454,13 +489,29 @@ func (e *EmailClient) WaitNewEmail(headerObj map[string]interface{}, timeoutMs i
 				}
 			}
 			
-			// Aspetta prima del prossimo polling
+			// Aspetta prima del prossimo polling con controllo di cancellazione
 			// fmt.Printf("No new emails found, waiting %v before next check\n", pollInterval)
-			time.Sleep(pollInterval)
+			select {
+			case <-cancelChan:
+				fmt.Printf("WaitNewEmail cancelled during sleep after %d iterations\n", iteration)
+				reject(fmt.Errorf("WaitNewEmail was cancelled"))
+				return
+			case <-time.After(pollInterval):
+				// Continua il loop
+			}
 		}
 	}()
 	
 	return promise
+}
+
+// killCurrentWaitNewMailPromise interrompe la promise corrente di WaitNewEmail se attiva
+func (e *EmailClient) KillCurrentWaitNewMailPromise() {
+	if e.cancelChan != nil {
+		close(e.cancelChan)
+		e.cancelChan = nil
+		fmt.Println("WaitNewEmail promise cancelled")
+	}
 }
 
 // DeleteEmailsOlderThan elimina tutte le email più vecchie della data specificata
